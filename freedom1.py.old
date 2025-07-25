@@ -1,0 +1,364 @@
+#! /usr/bin/env python3
+#
+# Python module example file
+# Miguel A.L. Paraz <mparaz@mparaz.com>
+#
+# $Id$
+
+import json
+import requests
+import time
+import re
+import datetime
+import redis
+
+
+import radiusd
+
+redis_ws = 'http://ws.freedom1.ru/redis/'
+r = redis.Redis(host = 'dev2.freedom1.ru', username = 'default', password = 'qwertfdsa', port = 6379, db = '')
+
+debug = True
+
+# Check post_auth for the most complete example using different
+# input and output formats
+
+def instantiate(p):
+    print("*** instantiate ***")
+    print(p)
+    # return 0 for success or -1 for failure
+
+
+def authorize(p):
+    print("*** authorize ***")
+    radiusd.radlog(radiusd.L_INFO, '*** radlog call in authorize ***')
+
+    session_req = {k:v for (k,v) in p}
+    login = find_login_by_session(session_req)
+    nasportid = nasportid_parse(session_req['NAS-Port-Id'])
+
+    if(login and session_req.get('Framed-Protocol') == 'PPP'):
+        password = login['password']
+    else:
+        password = 'ipoe'
+
+    # Авторизуем по логину
+    if(login):
+        config = (("Cleartext-Password", password),("Auth-Type", "Accept"))
+        update = dict()
+        update['Reply-Message'] = 'welcome'
+        update['Framed-Pool'] = "pool-" + nasportid['psiface']
+    # Логин не нашли, сделаем novlan сессию для ipoe
+    else:
+        config = (("Auth-Type", "Reject"))
+
+
+    return (
+        radiusd.RLM_MODULE_UPDATED,
+        tuple(update.items()),
+        config
+    )
+
+# return radiusd.RLM_MODULE_OK
+
+
+def preacct(p):
+    print("*** preacct ***")
+    print(p)
+    return radiusd.RLM_MODULE_OK
+
+
+def accounting(p):
+    print("*** accounting ***")
+    radiusd.radlog(radiusd.L_INFO, '*** radlog call in accounting (0) ***')
+
+    start_time = time.time()
+    session_template = json.load(open("/etc/freeradius/3.0/mods-config/python3/session-template.json"))
+
+    session_req = {k:v for (k,v) in p}
+    session_unique_id = session_req.get('Acct-Unique-Session-Id', None)
+
+    event_timestamp = int(time.mktime(time.strptime(session_req.get('Event-Timestamp'), "%b %d %Y %H:%M:%S UTC")))
+#    session_req.pop('Acct-Unique-Session-Id', None)
+    redis_session_url = redis_ws + 'radius:session:' + session_unique_id
+    redis_session_key = 'radius:session:' + session_unique_id
+
+
+#    session_read_resp = requests.get(redis_session_url)
+#    if(session_read_resp.ok and session_read_resp.json()):
+#        session_stored = json.loads(session_read_resp.json())
+#    else:
+#        session_stored = False
+
+    session_stored = r.json().get(redis_session_key)
+
+    login = find_login_by_session(session_req)
+
+    # Логин найден, сессия "авторизованная"
+    if(login):
+        # Изменились параметры авторизации, сессию сбрасываем
+        # При этом нужно записать старые значения логина
+        if(session_stored and session_stored['Login'] != login['login']):
+            coa_session_kill(session_stored)
+        else:
+            session_req['Login'] = login['login']
+            session_req['ContractNum'] = login['contract']
+            session_req['ONUMAC'] = login['onu_mac']
+
+        # здесь сверяем соответствие услуг в текущей сессии и в логине
+        if(datetime.datetime.fromtimestamp(login['servicecats']['internet']['timeto']) < datetime.datetime.today()):
+            coa_session_set(session_req)
+
+    # Логин не найден, сессия "неавторизованная"
+    else:
+        session_req['Login'] = False
+
+    # Сессия записана в БД, изменяем и обновляем
+    if(session_stored):
+        radiusd.radlog(radiusd.L_INFO, '#### Сессия записана в БД, изменяем и обновляем')
+
+        session_req['Acct-Session-Time'] = int(session_req['Acct-Session-Time'])
+        session_new = session_stored | session_req
+#        session_write_resp = requests.post(redis_session_url, json=session_new, verify=False)
+        r.json().set(redis_session_key, '.', session_new)
+        # Сессия закончилась, удаляем из redis
+        if(session_req['Acct-Status-Type'] == 'Stop'):
+            radiusd.radlog(radiusd.L_INFO, '#### Пришёл [Stop], удаляем из Redis и пишем в CH')
+#            session_delete_resp = requests.delete(redis_session_url)
+            r.json().delete(redis_session_key)
+
+    # Сессия записывается первый раз
+    else:
+        #login = requests.get(redis_search_url +  )
+        if(session_req['Acct-Status-Type'] == 'Start'):
+            # Acct-Status-Type == Start         -- Сессия запущена
+            radiusd.radlog(radiusd.L_INFO, '#### Сессия запущена [Start]')
+
+            session_req['Acct-Start-Time'] = event_timestamp
+            session_req['Acct-Session-Time'] = 0
+
+        if(session_req['Acct-Status-Type'] == 'Interim-Update'):
+            # Acct-Status-Type == Interim-Update         -- Сессия запущена ранее, но не была записана
+            radiusd.radlog(radiusd.L_INFO, '#### Сессия запущена ранее, но не была записана [Update]')
+
+            session_req['Acct-Start-Time'] = event_timestamp - int(session_req['Acct-Session-Time'])
+            session_req['Acct-Session-Time'] = int(session_req['Acct-Session-Time'])
+
+        if(session_req['Acct-Status-Type'] == 'Stop'):
+            # Acct-Status-Type == Stop         -- Сессия завершена, но не была записана
+            radiusd.radlog(radiusd.L_INFO, '#### Сессия завершена, но не была записана [Stop]')
+
+            session_req['Acct-Start-Time'] = event_timestamp - int(session_req['Acct-Session-Time'])
+            session_req['Acct-Session-Time'] = int(session_req['Acct-Session-Time'])
+
+            # Не пишем в redis
+            return radiusd.RLM_MODULE_OK
+
+        session_new = session_template | session_req
+#        session_write_resp = requests.post(redis_session_url, json=session_new, verify=False)
+        r.json().set(redis_session_key, '.', session_new)
+
+    end_time = time.time()
+    exec_time = (end_time - start_time) * 1000
+
+    radiusd.radlog(radiusd.L_INFO, '#### acct end, exec time: ' + str(exec_time))
+    return radiusd.RLM_MODULE_OK
+
+
+def pre_proxy(p):
+    print("*** pre_proxy ***")
+    print(p)
+    return radiusd.RLM_MODULE_OK
+
+
+def post_proxy(p):
+    print("*** post_proxy ***")
+    print(p)
+    return radiusd.RLM_MODULE_OK
+
+
+def post_auth(p):
+    print("*** post_auth ***")
+
+    # This is true when using pass_all_vps_dict
+    if type(p) is dict:
+        print("Request:", p["request"])
+        print("Reply:", p["reply"])
+        print("Config:", p["config"])
+        print("State:", p["session-state"])
+        print("Proxy-Request:", p["proxy-request"])
+        print("Proxy-Reply:", p["proxy-reply"])
+
+    else:
+        print(p)
+
+    # Dictionary representing changes we want to make to the different VPS
+    update_dict = {
+        "request": (("User-Password", ":=", "A new password"),),
+        "reply": (("Reply-Message", "The module is doing its job"),
+        ("User-Name", "NewUserName")),
+        "config": (("Cleartext-Password", "A new password"),),
+    }
+
+    return radiusd.RLM_MODULE_OK, update_dict
+    # Alternatively, you could use the legacy 3-tuple output
+    # (only reply and config can be updated)
+    # return radiusd.RLM_MODULE_OK, update_dict["reply"], update_dict["config"]
+
+
+def recv_coa(p):
+    print("*** recv_coa ***")
+    print(p)
+    return radiusd.RLM_MODULE_OK
+
+
+def send_coa(p):
+    print("*** send_coa ***")
+    print(p)
+    return radiusd.RLM_MODULE_OK
+
+
+def detach(p):
+    print("*** goodbye from example.py ***")
+    return radiusd.RLM_MODULE_OK
+
+def is_mac_username(username):
+    m = re.match('^([0-9a-f]{4}\.){2}([0-9a-f]{4})$', username)
+    if(m):
+        return True
+    else:
+        return False
+
+def mac_from_hex(hex_var):
+    # /* Для Элтекса формат ELTXFFFFFFFF -- приходит 0x454c54581a025927 */
+    if(re.match('^0x454c5458[0-9a-f]{8}$', hex_var, re.IGNORECASE)):
+        return ('ELTX' + hex_var[10:]).upper()
+    # /* Для C-DATA через Элтекс формат 70:A5:6A:FF:FF:FF */
+    if(re.match('^0x485754436A[0-9a-f]{6}$', hex_var, re.IGNORECASE)):
+        return ('70:A5:' + hex_var[10:12] + ':' + hex_var[12:14] + ':' + hex_var[14:16] + ':' + hex_var[16:18]).upper()
+    # /* Для C-DATA через Элтекс формат 80:F7:A6:FF:FF:FF */
+    if(re.match('^0x48575443A6[0-9a-f]{6}$', hex_var, re.IGNORECASE)):
+        return ('80:F7:' + hex_var[10:12] + ':' + hex_var[12:14] + ':' + hex_var[14:16] + ':' + hex_var[16:18]).upper()
+    # /* Для C-DATA через Элтекс формат E0:E8:E6:FF:FF:FF */
+    if(re.match('^0x48575443E6[0-9a-f]{6}$', hex_var, re.IGNORECASE)):
+        return ('E0:E8:' + hex_var[10:12] + ':' + hex_var[12:14] + ':' + hex_var[14:16] + ':' + hex_var[16:18]).upper()
+    # /* Для C-DATA через Элтекс формат 50:5B:1D:FF:FF:FF */
+    if(re.match('^0x485754431D[0-9a-f]{6}$', hex_var, re.IGNORECASE)):
+        return ('50:5B:' + hex_var[10:12] + ':' + hex_var[12:14] + ':' + hex_var[14:16] + ':' + hex_var[16:18]).upper()
+    # /* Для C-DATA 1616 формат 70:A5:E6:FF:FF:FF  -- приходит 0x485754433641413642444231 */
+    if(re.match('^0x485754433641[0-9a-f]{12}$', hex_var, re.IGNORECASE)):
+        return ('70:A5:' \
+            + bytearray.fromhex(hex_var[10:14]).decode() + ':' + bytearray.fromhex(hex_var[14:18]).decode() + ':' \
+            + bytearray.fromhex(hex_var[18:22]).decode() + ':' + bytearray.fromhex(hex_var[22:26]).decode()
+        )
+    # /* Для C-DATA 1616 формат 80:F7:6A:FF:FF:FF */
+    if(re.match('^0x485754434136[0-9a-f]{12}$', hex_var, re.IGNORECASE)):
+        return ('80:F7:' \
+            + bytearray.fromhex(hex_var[10:14]).decode() + ':' + bytearray.fromhex(hex_var[14:18]).decode() + ':' \
+            + bytearray.fromhex(hex_var[18:22]).decode() + ':' + bytearray.fromhex(hex_var[22:26]).decode()
+        )
+    # /* Для C-DATA 1616 формат 50:5B:1D:FF:FF:FF -- приходит 0x485754433144343442453738 */
+    if(re.match('^0x485754433144[0-9a-f]{12}$', hex_var, re.IGNORECASE)):
+        return ('50:5B:' \
+            + bytearray.fromhex(hex_var[10:14]).decode() + ':' + bytearray.fromhex(hex_var[14:18]).decode() + ':' \
+            + bytearray.fromhex(hex_var[18:22]).decode() + ':' + bytearray.fromhex(hex_var[22:26]).decode()
+        )
+    # /* Для MA5800 формат 80:F7:A6:FF:FF:FF  -- приходит 0x34383537353434334136354141354232 */
+    if(re.match('^0x34383537353434334136[0-9a-f]{12}$', hex_var, re.IGNORECASE)):
+        return ('80:F7:' \
+            + bytearray.fromhex(hex_var[18:22]).decode() + ':' + bytearray.fromhex(hex_var[22:26]).decode() + ':' \
+            + bytearray.fromhex(hex_var[26:30]).decode() + ':' + bytearray.fromhex(hex_var[30:34]).decode()
+        )
+    # /* Для MA5800 формат 70:A5:6A:FF:FF:FF  -- приходит 0x34383537353434333641413642453137 */
+    if(re.match('^0x34383537353434333641[0-9a-f]{12}$', hex_var, re.IGNORECASE)):
+        return ('70:A5:' \
+            + bytearray.fromhex(hex_var[18:22]).decode() + ':' + bytearray.fromhex(hex_var[22:26]).decode() + ':' \
+            + bytearray.fromhex(hex_var[26:30]).decode() + ':' + bytearray.fromhex(hex_var[30:34]).decode()
+        )
+    # /* Для MA5800 формат 50:5B:1D:FF:FF:FF  -- приходит 0x34383537353434333144343442453630 */
+    if(re.match('^0x34383537353434333144[0-9a-f]{12}$', hex_var, re.IGNORECASE)):
+        return ('50:5B:' \
+            + bytearray.fromhex(hex_var[18:22]).decode() + ':' + bytearray.fromhex(hex_var[22:26]).decode() + ':' \
+            + bytearray.fromhex(hex_var[26:30]).decode() + ':' + bytearray.fromhex(hex_var[30:34]).decode()
+        )
+
+    # /* Для C-DATA формат FF:FF:FF:FF:FF:FF */
+    return (hex_var[2:4] + ':' + hex_var[4:6] + ':' + hex_var[6:8] + ':' + hex_var[8:10] \
+        + ':' + hex_var[10:12] + ':' + hex_var[12:14]).upper()
+
+def mac_from_username(username):
+    return (username[0:2] + ':' + username[2:4] + ':' + username[5:7] + ':' \
+        + username[7:9] + ':' + username[10:12] + ':' + username[12:14]).upper()
+
+def nasportid_parse(nasportid):
+    m = re.match('^(?P<psiface>ps\d+)\.\d+\:(?P<svlan>\d+)\-(?P<cvlan>\d+)$', nasportid)
+    r = { 'psiface': '', 'svlan': '', 'cvlan': '' }
+    if(m):
+        return m.groupdict()
+    else:
+        return r
+
+# Находим логин по данным из запроса
+# Для аккаунтинга и для авторизации по идее должен работать одинаково
+# Если логин не найден или же найдено несколько подходящих - вернёт False
+def find_login_by_session(session):
+    nasportid = nasportid_parse(session['NAS-Port-Id'])
+    login = False
+    # Сессия IPOE
+    if(is_mac_username(session['User-Name'])):
+
+        # 1. Ищем mac+vlan
+        logins = r.ft('idx:radius:login').search('@mac:{' \
+            + mac_from_username(session['User-Name']).replace(':', '\:') + '}@vlan:{' + nasportid['cvlan'] + '}')
+        if(logins.total == 1):
+            return json.loads(logins.docs[0].json)
+
+        # 2. Ищем onu_mac
+#        logins_resp = requests.get(redis_ws + 'raw?query=FT.SEARCH idx:radius:login @onu_mac:{' \
+#            + mac_from_hex(session.get('ADSL-Agent-Remote-Id').replace(':', '\\:') + '}'))
+#        if(logins_resp.ok):
+#            logins = json.loads(logins_resp.text)
+#            if(logins and len(logins) == 1):
+#                return list(logins.values())[0]
+        logins = r.ft('idx:radius:login').search('@onu_mac:{' \
+            + mac_from_hex(session.get('ADSL-Agent-Remote-Id')).replace(':', '\:') + '}')
+        if(logins.total == 1):
+            return json.loads(logins.docs[0].json)
+
+
+    # Сессия PPPOE или статика
+    else:
+
+        # 3. Статические сессии (dyn-ip), логин вида static-хх.хх.хх.хх
+        m = re.match('^static-(.+)', session['User-Name'])
+        if(m):
+            ip = m.groups()[0]
+            logins = r.ft('idx:radius:login').search('@ip_addr:{' \
+                + ip.replace('.', '\\.') + '}@vlan:{' + nasportid['cvlan'] + '}')
+            if(logins.total == 1):
+                return json.loads(logins.docs[0].json)
+
+        else:
+            # 4. PPPoE, ищем логин по юзернейму
+#            logins_resp = requests.get(redis_ws + 'login:' + session['User-Name'].strip().lower())
+            login = r.json().get('login:' + session['User-Name'])
+            if(login):
+                return login
+
+    return login
+
+
+def coa_session_kill(session):
+    return
+def coa_session_set(session):
+    return
+
+# FT.CREATE idx:radius:login ON JSON PREFIX 1 login: SCHEMA $.onu_mac AS onu_mac TAG $.mac AS mac TAG $.ip_addr AS ip_addr TAG $.vlan AS vlan TAG
+# FT.DROPINDEX idx:radius:login
+# FT.SEARCH idx:radius:login "@mac:{48\\:22\\:54\\:EE\\:A5\\:DB} @vlan:{114}"
+#
+# FT.CREATE idx:radius:session ON JSON PREFIX 1 radius:session: SCHEMA $.Login AS login TEXT $.Acct-Status-Type AS status TAG $.ContractNum AS contract TAG
+# FT.DROPINDEX idx:radius:session
+
+#
+# EVAL "return redis.call('DEL', unpack(redis.call('KEYS', ARGV[1] .. '*')))" 0 radius:session:
