@@ -27,18 +27,47 @@ ch = Client('localhost', user='default', password='Kehrvjfh321')
 exchange_name = "sessions_traffic_exchange"
 
 # Создание клиента RabbitMQ
-rmq_connection = pika.BlockingConnection(pika.URLParameters(AMQP_URL))
-rmq_channel = rmq_connection.channel()
+rmq_connection = None
+rmq_channel = None
 
 debug = 3
 
-# Check post_auth for the most complete example using different
-# input and output formats
+def init_rabbitmq():
+    """Инициализация соединения с RabbitMQ"""
+    global rmq_connection, rmq_channel
+    try:
+        # Параметры соединения с таймаутом
+        parameters = pika.URLParameters(AMQP_URL)
+        parameters.connection_attempts = 3
+        parameters.retry_delay = 1.0
+        parameters.socket_timeout = 10
+        parameters.heartbeat = 600
+        
+        rmq_connection = pika.BlockingConnection(parameters)
+        rmq_channel = rmq_connection.channel()
+        exchange_name = "sessions_traffic_exchange"
+        rmq_channel.exchange_declare(exchange=exchange_name, exchange_type='direct', durable=True)
+        
+        if debug > 1:
+            rad_log_session("RabbitMQ соединение установлено", 'INFO')
+        return True
+    except Exception as e:
+        if debug > 0:
+            rad_log_session(f"Ошибка инициализации RabbitMQ: {e}", 'ERROR')
+        rmq_connection = None
+        rmq_channel = None
+        return False
 
 def instantiate(p):
     print("*** instantiate ***")
+    
+    # Инициализируем RabbitMQ соединение
+    if init_rabbitmq():
+        print("RabbitMQ connection initialized successfully")
+    else:
+        print("Failed to initialize RabbitMQ connection")
+    
     print(p)
-    # return 0 for success or -1 for failure
 
 
 def authorize(p):
@@ -517,7 +546,6 @@ def ch_save_traffic(session_new, session_stored = None):
     if(debug > 2):
         rad_log_session('ch_save_traffic(): ' + json.dumps(traffic_data), 'DEBUG')
 
-    # Отправляем структурированные данные трафика
     rmq_send_message("traffic_queue", traffic_data)
 
     return True
@@ -526,24 +554,38 @@ def repl_none(some_dict):
     return { k: ('' if v is None else v) for k, v in some_dict.items() }
 
 def rmq_send_message(routing_key, message):
-    exchange_name = "sessions_traffic_exchange"
-    rmq_channel.exchange_declare(exchange = exchange_name, exchange_type = 'direct', durable = True)
-
     """Отправка сообщения через exchange в RabbitMQ"""
+    global rmq_connection, rmq_channel
+    
     try:
-        # Сериализуем сообщение с обработкой datetime объектов
+        if rmq_connection is None or rmq_connection.is_closed:
+            if not init_rabbitmq():
+                raise Exception("Не удалось создать соединение с RabbitMQ")
+        
+        if rmq_channel is None or rmq_channel.is_closed:
+            if rmq_connection is not None:
+                rmq_channel = rmq_connection.channel()
+                exchange_name = "sessions_traffic_exchange"
+                rmq_channel.exchange_declare(exchange=exchange_name, exchange_type='direct', durable=True)
+            else:
+                raise Exception("Соединение с RabbitMQ недоступно")
+        
+        exchange_name = "sessions_traffic_exchange"
+        
         message_json = json.dumps(message, default=str, ensure_ascii=False)
         rmq_channel.basic_publish(
-            exchange = exchange_name,
-            routing_key = routing_key,
-            body = message_json.encode('utf-8'),
-            properties = pika.BasicProperties(delivery_mode = 2)
+            exchange=exchange_name,
+            routing_key=routing_key,
+            body=message_json.encode('utf-8'),
+            properties=pika.BasicProperties(delivery_mode=2)
         )
-        if(debug > 2):
+        if debug > 2:
             rad_log_session(f'Сообщение отправлено в {routing_key}: {len(message_json)} байт', 'DEBUG')
     except Exception as e:
-        if(debug > 0):
+        if debug > 0:
             rad_log_session(f'Ошибка отправки сообщения в {routing_key}: {e}', 'ERROR')
+        rmq_connection = None
+        rmq_channel = None
         raise
 
 
