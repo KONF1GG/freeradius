@@ -26,11 +26,18 @@ ch = Client('localhost', user='default', password='Kehrvjfh321')
 
 exchange_name = "sessions_traffic_exchange"
 
+SESSION_TEMPLATE = json.load(open("/etc/freeradius/3.0/mods-config/python3/session-template.json"))
+_EVENT_FMT = "%b %d %Y %H:%M:%S +05"
+
 # Создание клиента RabbitMQ
 rmq_connection = None
 rmq_channel = None
 
 debug = 3
+
+def parse_event(ts: str) -> int:
+    """Кэш-функция для Event-Timestamp"""
+    return int(time.mktime(time.strptime(ts, _EVENT_FMT)))
 
 def init_rabbitmq():
     """Инициализация соединения с RabbitMQ"""
@@ -117,7 +124,7 @@ def accounting(p):
     if(debug > 2): rad_log_session('acct start', 'DEBUG')
 
     start_time = time.time()
-    session_template = json.load(open("/etc/freeradius/3.0/mods-config/python3/session-template.json"))
+    session_template = SESSION_TEMPLATE
 
     session_req = {k:v for (k,v) in p}
     session_unique_id = session_req.get('Acct-Unique-Session-Id', None)
@@ -138,7 +145,7 @@ def accounting(p):
 
 
 
-    event_timestamp = int(time.mktime(time.strptime(session_req.get('Event-Timestamp'), "%b %d %Y %H:%M:%S +05")))
+    event_timestamp = parse_event(session_req.get('Event-Timestamp'))
 
     if(debug > 2):
         print(session_req)
@@ -482,7 +489,7 @@ def ch_save_session(session):
 
     session['Acct-Start-Time'] = datetime.datetime.fromtimestamp(session['Acct-Start-Time'], tz=datetime.timezone.utc)
     session['Acct-Update-Time'] = session['Acct-Start-Time']
-    event_timestamp = int(time.mktime(time.strptime(session.get('Event-Timestamp'), "%b %d %Y %H:%M:%S +05")))
+    event_timestamp = parse_event(session.get('Event-Timestamp'))
     session['Acct-Stop-Time'] = datetime.datetime.fromtimestamp(event_timestamp, tz=datetime.timezone.utc)
     
     # Конвертируем datetime в строки для JSON сериализации
@@ -517,7 +524,7 @@ def ch_save_session(session):
         # print(datetime.datetime.fromtimestamp(session['Acct-Start-Time'], tz=datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours=5))).strftime('%Y-%m-%d %H:%M:%S'))
 
 #    ch.execute('INSERT INTO radius.radius_sessions_new (' + columns_list + ') VALUES', data)
-    print(session)
+    # print(session)
     rmq_send_message("session_queue", session)
     return True
 
