@@ -274,7 +274,7 @@ def detach(p):
     return radiusd.RLM_MODULE_OK
 
 def is_mac_username(username):
-    m = re.match('^([0-9a-f]{4}\.){2}([0-9a-f]{4})$', username)
+    m = re.match(r'^([0-9a-f]{4}\.){2}([0-9a-f]{4})$', username)
     if(m):
         return True
     else:
@@ -342,7 +342,7 @@ def mac_from_username(username):
         + username[7:9] + ':' + username[10:12] + ':' + username[12:14]).upper()
 
 def nasportid_parse(nasportid):
-    m = re.match('^(?P<psiface>ps\d+)\.\d+\:(?P<svlan>\d+)\-?(?P<cvlan>\d+)?$', nasportid)
+    m = re.match(r'^(?P<psiface>ps\d+)\.\d+\:(?P<svlan>\d+)\-?(?P<cvlan>\d+)?$', nasportid)
     r = { 'psiface': '', 'svlan': '', 'cvlan': '' }
     if(m):
         return r | m.groupdict()
@@ -365,7 +365,7 @@ def find_login_by_session(session):
 
         # 1. Ищем mac+vlan
         logins = r.ft('idx:radius:login').search('@mac:{' \
-            + mac_from_username(session['User-Name']).replace(':', '\:') + '}@vlan:{' + vlan + '}')
+            + mac_from_username(session['User-Name']).replace(':', r'\:') + '}@vlan:{' + vlan + '}')
         if(logins.total == 1):
             ret = json.loads(logins.docs[0].json)
             ret['auth_type'] = 'MAC+VLAN'
@@ -375,7 +375,7 @@ def find_login_by_session(session):
         if(not session.get('ADSL-Agent-Remote-Id')):
             return False
         logins = r.ft('idx:radius:login').search('@onu_mac:{' \
-            + mac_from_hex(session.get('ADSL-Agent-Remote-Id')).replace(':', '\:') + '}')
+            + mac_from_hex(session.get('ADSL-Agent-Remote-Id')).replace(':', r'\:') + '}')
         if(logins.total == 1):
             ret = json.loads(logins.docs[0].json)
             ret['auth_type'] = 'OPT82'
@@ -400,8 +400,9 @@ def find_login_by_session(session):
         else:
             # 4. PPPoE, ищем логин по юзернейму
 #            logins_resp = requests.get(redis_ws + 'login:' + session['User-Name'].strip().lower())
-            login = r.json().get('login:' + session['User-Name'].strip().lower())
-            if(login):
+            login_json = r.json().get('login:' + session['User-Name'].strip().lower())
+            if(login_json):
+                login = json.loads(login_json) if isinstance(login_json, str) else login_json
                 login['auth_type'] = 'PPPOE'
                 return repl_none(login)
 
@@ -455,6 +456,11 @@ def ch_save_session(session):
     event_timestamp = int(time.mktime(time.strptime(session.get('Event-Timestamp'), "%b %d %Y %H:%M:%S +05")))
     session['Acct-Stop-Time'] = datetime.datetime.fromtimestamp(event_timestamp, tz=datetime.timezone.utc)
     
+    # Конвертируем datetime в строки для JSON сериализации
+    session['Acct-Start-Time'] = session['Acct-Start-Time'].strftime('%Y-%m-%d %H:%M:%S')
+    session['Acct-Update-Time'] = session['Acct-Update-Time'].strftime('%Y-%m-%d %H:%M:%S')
+    session['Acct-Stop-Time'] = session['Acct-Stop-Time'].strftime('%Y-%m-%d %H:%M:%S')
+    
     session['Framed-Protocol'] = session.get('Framed-Protocol', '')
     session['Framed-IPv6-Prefix'] = session.get('Framed-IPv6-Prefix', '')
     session['Delegated-IPv6-Prefix'] = session.get('Delegated-IPv6-Prefix', '')
@@ -492,27 +498,27 @@ def ch_save_traffic(session_new, session_stored = None):
         'Acct-Output-Packets', 'ERX-IPv6-Acct-Input-Octets', 'ERX-IPv6-Acct-Output-Octets','ERX-IPv6-Acct-Input-Packets', \
         'ERX-IPv6-Acct-Output-Packets']
 
-    if(session_stored):
-        row = [(session_new[x] or 0) - (session_stored[x] or 0) for x in columns]
-    else:
-        row = [session_new[x] or 0 for x in columns]
-    
-    columns.append('Acct-Unique-Session-Id')
-    row.append(session_new['Acct-Unique-Session-Id'])
+    # Формируем данные трафика для отправки в RabbitMQ
+    traffic_data = {
+        'Acct-Unique-Session-Id': session_new['Acct-Unique-Session-Id'],
+        'login': session_new.get('login', ''),
+        'timestamp': time.time()
+    }
 
-    data = [row]
-    columns_list = '`' + '`,`'.join(columns) + '`'
+    if(session_stored):
+        # Дельта трафика
+        for col in columns:
+            traffic_data[col] = (session_new.get(col, 0) or 0) - (session_stored.get(col, 0) or 0)
+    else:
+        # Весь трафик (для новых сессий)
+        for col in columns:
+            traffic_data[col] = session_new.get(col, 0) or 0
 
     if(debug > 2):
-        rad_log_session('ch_save_traffic(): ' + 'INSERT INTO radius.radius_traffic (' + columns_list + ') VALUES', 'DEBUG')
-        rad_log_session('ch_save_traffic(): ' + ('|'.join(str(v) for v in row)), 'DEBUG')
+        rad_log_session('ch_save_traffic(): ' + json.dumps(traffic_data), 'DEBUG')
 
-#    ch.execute('INSERT INTO radius.radius_traffic (' + columns_list + ') VALUES', data)
-#    rmq_client.send_message(exchange_name, "session_queue", session_message)
-    print(session_new)
-    rmq_send_message("traffic_queue", session_new)
-
-    # print(ch.rowcount)
+    # Отправляем структурированные данные трафика
+    rmq_send_message("traffic_queue", traffic_data)
 
     return True
 
@@ -524,12 +530,21 @@ def rmq_send_message(routing_key, message):
     rmq_channel.exchange_declare(exchange = exchange_name, exchange_type = 'direct', durable = True)
 
     """Отправка сообщения через exchange в RabbitMQ"""
-    rmq_channel.basic_publish(
-        exchange = exchange_name,
-        routing_key = routing_key,
-        body = json.dumps(message).encode('utf-8'),
-        properties = pika.BasicProperties(delivery_mode = 2)
-    )
+    try:
+        # Сериализуем сообщение с обработкой datetime объектов
+        message_json = json.dumps(message, default=str, ensure_ascii=False)
+        rmq_channel.basic_publish(
+            exchange = exchange_name,
+            routing_key = routing_key,
+            body = message_json.encode('utf-8'),
+            properties = pika.BasicProperties(delivery_mode = 2)
+        )
+        if(debug > 2):
+            rad_log_session(f'Сообщение отправлено в {routing_key}: {len(message_json)} байт', 'DEBUG')
+    except Exception as e:
+        if(debug > 0):
+            rad_log_session(f'Ошибка отправки сообщения в {routing_key}: {e}', 'ERROR')
+        raise
 
 
 def rad_log_session(msg, msg_type, session = None):
